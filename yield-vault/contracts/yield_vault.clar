@@ -235,3 +235,211 @@
         b
     )
 )
+
+;; Public Functions
+
+;; Create a new yield vault
+(define-public (create-vault
+        (name (string-ascii 64))
+        (risk-level uint)
+        (min-deposit uint)
+    )
+    (let (
+            (vault-id (+ (var-get vault-counter) u1))
+            (best-strategy (get-best-strategy risk-level))
+        )
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (and (>= risk-level u1) (<= risk-level u3)) ERR_INVALID_AMOUNT)
+        ;; Create vault
+        (map-set vaults vault-id {
+            name: name,
+            asset: .stx-token, ;; Default to STX
+            total-shares: u0,
+            total-assets: u0,
+            strategy-id: best-strategy,
+            risk-level: risk-level,
+            min-deposit: min-deposit,
+            is-active: true,
+            created-at: stacks-block-height,
+            last-harvest: stacks-block-height,
+        })
+        ;; Set default strategy allocation
+        (map-set strategy-allocations {
+            vault-id: vault-id,
+            strategy-id: best-strategy,
+        }
+            u10000
+        )
+        ;; Update counter
+        (var-set vault-counter vault-id)
+        (ok vault-id)
+    )
+)
+
+;; Deposit assets into a vault
+(define-public (deposit
+        (vault-id uint)
+        (amount uint)
+    )
+    (let (
+            (vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND))
+            (user tx-sender)
+            (shares-to-mint (calculate-shares amount (get total-assets vault-data)
+                (get total-shares vault-data)
+            ))
+            (current-position (default-to {
+                shares: u0,
+                deposited-at: stacks-block-height,
+                last-compound: stacks-block-height,
+                total-deposited: u0,
+                total-withdrawn: u0,
+            }
+                (map-get? user-positions {
+                    vault-id: vault-id,
+                    user: user,
+                })
+            ))
+        )
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (get is-active vault-data) ERR_VAULT_PAUSED)
+        (asserts! (>= amount (get min-deposit vault-data))
+            ERR_MINIMUM_DEPOSIT_NOT_MET
+        )
+        ;; Compound existing earnings before new deposit
+        (compound-vault-earnings vault-id)
+        ;; Transfer STX from user to contract
+        (try! (stx-transfer? amount user (as-contract tx-sender)))
+        ;; Update user position
+        (map-set user-positions {
+            vault-id: vault-id,
+            user: user,
+        } {
+            shares: (+ (get shares current-position) shares-to-mint),
+            deposited-at: (get deposited-at current-position),
+            last-compound: stacks-block-height,
+            total-deposited: (+ (get total-deposited current-position) amount),
+            total-withdrawn: (get total-withdrawn current-position),
+        })
+        ;; Update vault totals
+        (map-set vaults vault-id
+            (merge vault-data {
+                total-shares: (+ (get total-shares vault-data) shares-to-mint),
+                total-assets: (+ (get total-assets vault-data) amount),
+            })
+        )
+        ;; Update global TVL
+        (var-set total-value-locked (+ (var-get total-value-locked) amount))
+        ;; Add vault to user's list
+        (update-user-vault-list user vault-id)
+        (ok shares-to-mint)
+    )
+)
+
+;; Withdraw assets from vault
+(define-public (withdraw
+        (vault-id uint)
+        (shares uint)
+    )
+    (let (
+            (vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND))
+            (user tx-sender)
+            (user-position (unwrap!
+                (map-get? user-positions {
+                    vault-id: vault-id,
+                    user: user,
+                })
+                ERR_INSUFFICIENT_BALANCE
+            ))
+            (user-shares (get shares user-position))
+            (assets-to-withdraw (calculate-assets shares (get total-assets vault-data)
+                (get total-shares vault-data)
+            ))
+            (platform-fee (/ (* assets-to-withdraw (var-get platform-fee-rate)) u10000))
+            (net-withdrawal (- assets-to-withdraw platform-fee))
+        )
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (<= shares user-shares) ERR_WITHDRAWAL_TOO_LARGE)
+        (asserts! (> shares u0) ERR_INVALID_AMOUNT)
+        ;; Compound earnings before withdrawal
+        (compound-vault-earnings vault-id)
+        ;; Update user position
+        (if (is-eq shares user-shares)
+            ;; Full withdrawal - remove position
+            (map-delete user-positions {
+                vault-id: vault-id,
+                user: user,
+            })
+            ;; Partial withdrawal - update position
+            (map-set user-positions {
+                vault-id: vault-id,
+                user: user,
+            }
+                (merge user-position {
+                    shares: (- user-shares shares),
+                    total-withdrawn: (+ (get total-withdrawn user-position) net-withdrawal),
+                })
+            )
+        )
+        ;; Update vault totals
+        (map-set vaults vault-id
+            (merge vault-data {
+                total-shares: (- (get total-shares vault-data) shares),
+                total-assets: (- (get total-assets vault-data) assets-to-withdraw),
+            })
+        )
+        ;; Transfer assets to user (minus fee)
+        (try! (as-contract (stx-transfer? net-withdrawal tx-sender user)))
+        ;; Transfer fee to treasury
+        (if (> platform-fee u0)
+            (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get treasury))))
+            true
+        )
+        ;; Update global TVL
+        (var-set total-value-locked
+            (- (var-get total-value-locked) assets-to-withdraw)
+        )
+        (ok net-withdrawal)
+    )
+)
+
+;; Compound all earnings in a vault
+(define-public (harvest-vault (vault-id uint))
+    (let ((vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND)))
+        (asserts! (not (var-get emergency-pause)) ERR_VAULT_PAUSED)
+        (asserts! (get is-active vault-data) ERR_VAULT_PAUSED)
+        ;; Compound earnings
+        (asserts! (compound-vault-earnings vault-id) (ok false))
+        (ok true)
+    )
+)
+
+;; Rebalance vault strategies (admin only)
+(define-public (rebalance-vault
+        (vault-id uint)
+        (new-strategy-id uint)
+    )
+    (let (
+            (vault-data (unwrap! (map-get? vaults vault-id) ERR_VAULT_NOT_FOUND))
+            (strategy-data (unwrap! (map-get? yield-strategies new-strategy-id)
+                ERR_STRATEGY_NOT_FOUND
+            ))
+        )
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active strategy-data) ERR_STRATEGY_INACTIVE)
+        ;; Harvest current position before rebalancing
+        (try! (harvest-vault vault-id))
+        ;; Update vault strategy
+        (map-set vaults vault-id
+            (merge vault-data { strategy-id: new-strategy-id })
+        )
+        ;; Update strategy allocation
+        (map-set strategy-allocations {
+            vault-id: vault-id,
+            strategy-id: new-strategy-id,
+        }
+            u10000
+        )
+        (ok true)
+    )
+)
