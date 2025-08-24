@@ -443,3 +443,154 @@
         (ok true)
     )
 )
+
+;; Admin Functions
+
+;; Add or update yield strategy
+(define-public (add-strategy
+        (name (string-ascii 64))
+        (protocol (string-ascii 32))
+        (apy uint)
+        (capacity uint)
+        (risk-score uint)
+        (contract-addr principal)
+    )
+    (let ((strategy-id (+ (var-get strategy-counter) u1)))
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (map-set yield-strategies strategy-id {
+            name: name,
+            protocol: protocol,
+            apy: apy,
+            tvl-capacity: capacity,
+            current-tvl: u0,
+            risk-score: risk-score,
+            is-active: true,
+            contract-address: contract-addr,
+            last-updated: stacks-block-height,
+        })
+        (var-set strategy-counter strategy-id)
+        (ok strategy-id)
+    )
+)
+
+;; Update strategy APY
+(define-public (update-strategy-apy
+        (strategy-id uint)
+        (new-apy uint)
+    )
+    (let ((strategy-data (unwrap! (map-get? yield-strategies strategy-id) ERR_STRATEGY_NOT_FOUND)))
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (map-set yield-strategies strategy-id
+            (merge strategy-data {
+                apy: new-apy,
+                last-updated: stacks-block-height,
+            })
+        )
+        (ok new-apy)
+    )
+)
+
+;; Set platform fees
+(define-public (set-platform-fee (new-fee uint))
+    (begin
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (<= new-fee u1000) ERR_INVALID_AMOUNT) ;; Max 10% fee
+        (var-set platform-fee-rate new-fee)
+        (ok new-fee)
+    )
+)
+
+;; Add admin role
+(define-public (add-admin (new-admin principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (map-set admin-roles new-admin true)
+        (ok true)
+    )
+)
+
+;; Emergency pause
+(define-public (toggle-emergency-pause)
+    (begin
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (var-set emergency-pause (not (var-get emergency-pause)))
+        (ok (var-get emergency-pause))
+    )
+)
+
+;; Read-only Functions
+
+;; Get vault information
+(define-read-only (get-vault-info (vault-id uint))
+    (map-get? vaults vault-id)
+)
+
+;; Get user position
+(define-read-only (get-user-position
+        (vault-id uint)
+        (user principal)
+    )
+    (map-get? user-positions {
+        vault-id: vault-id,
+        user: user,
+    })
+)
+
+;; Get user's vault value
+(define-read-only (get-user-vault-value
+        (vault-id uint)
+        (user principal)
+    )
+    (let (
+            (vault-data (unwrap! (map-get? vaults vault-id) u0))
+            (user-position (unwrap!
+                (map-get? user-positions {
+                    vault-id: vault-id,
+                    user: user,
+                })
+                u0
+            ))
+            (user-shares (get shares user-position))
+        )
+        (calculate-assets user-shares (get total-assets vault-data)
+            (get total-shares vault-data)
+        )
+    )
+)
+
+;; Get strategy information
+(define-read-only (get-strategy-info (strategy-id uint))
+    (map-get? yield-strategies strategy-id)
+)
+
+;; Get platform statistics
+(define-read-only (get-platform-stats)
+    {
+        total-value-locked: (var-get total-value-locked),
+        total-vaults: (var-get vault-counter),
+        total-strategies: (var-get strategy-counter),
+        platform-fee-rate: (var-get platform-fee-rate),
+        emergency-pause: (var-get emergency-pause),
+    }
+)
+
+;; Get user's all vaults
+(define-read-only (get-user-vaults (user principal))
+    (default-to (list) (map-get? user-vault-list user))
+)
+
+;; Get best APY available
+(define-read-only (get-best-apy)
+    (let (
+            (strategy1 (unwrap-panic (map-get? yield-strategies u1)))
+            (strategy2 (unwrap-panic (map-get? yield-strategies u2)))
+            (strategy3 (unwrap-panic (map-get? yield-strategies u3)))
+        )
+        (max (max (get apy strategy1) (get apy strategy2)) (get apy strategy3))
+    )
+)
+
+;; Check if user is admin
+(define-read-only (is-user-admin (user principal))
+    (is-admin user)
+)
