@@ -689,4 +689,352 @@ describe("Yield Vault - Advanced Operations", () => {
   });
 });
 
+describe("Yield Vault - Edge Cases & Error Handling", () => {
+  describe("Emergency Pause Scenarios", () => {
+    beforeEach(() => {
+      // Create vault for testing
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Emergency Test Vault"),
+          Cl.uint(2),
+          Cl.uint(1000000),
+        ],
+        deployer
+      );
+      
+      // Alice deposits
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(5000000)],
+        alice
+      );
+      
+      // Enable emergency pause
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "toggle-emergency-pause",
+        [],
+        deployer
+      );
+    });
+
+    it("should reject vault creation when paused", () => {
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Paused Vault"),
+          Cl.uint(1),
+          Cl.uint(1000000),
+        ],
+        deployer
+      );
+      
+      expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+    });
+
+    it("should reject deposits when paused", () => {
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(2000000)],
+        bob
+      );
+      
+      expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+    });
+
+    it("should reject withdrawals when paused", () => {
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "withdraw",
+        [Cl.uint(1), Cl.uint(1000000)],
+        alice
+      );
+      
+      expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+    });
+
+    it("should reject harvesting when paused", () => {
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "harvest-vault",
+        [Cl.uint(1)],
+        alice
+      );
+      
+      expect(result).toBeErr(Cl.uint(205)); // ERR_VAULT_PAUSED
+    });
+  });
+
+  describe("Non-existent Operations", () => {
+    it("should reject operations on non-existent vaults", () => {
+      const { result: deposit } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(999), Cl.uint(5000000)],
+        alice
+      );
+      expect(deposit).toBeErr(Cl.uint(203)); // ERR_VAULT_NOT_FOUND
+
+      const { result: withdraw } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "withdraw",
+        [Cl.uint(999), Cl.uint(1000000)],
+        alice
+      );
+      expect(withdraw).toBeErr(Cl.uint(203)); // ERR_VAULT_NOT_FOUND
+
+      const { result: harvest } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "harvest-vault",
+        [Cl.uint(999)],
+        alice
+      );
+      expect(harvest).toBeErr(Cl.uint(203)); // ERR_VAULT_NOT_FOUND
+    });
+
+    it("should return none for non-existent vault/strategy info", () => {
+      const { result: vaultInfo } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-vault-info",
+        [Cl.uint(999)],
+        deployer
+      );
+      expect(vaultInfo).toBeNone();
+
+      const { result: strategyInfo } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-strategy-info",
+        [Cl.uint(999)],
+        deployer
+      );
+      expect(strategyInfo).toBeNone();
+
+      const { result: userValue } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-user-vault-value",
+        [Cl.uint(999), Cl.standardPrincipal(alice)],
+        alice
+      );
+      expect(userValue).toBeUint(0);
+    });
+  });
+
+  describe("Zero Amount Edge Cases", () => {
+    beforeEach(() => {
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Zero Test Vault"),
+          Cl.uint(2),
+          Cl.uint(1000000),
+        ],
+        deployer
+      );
+    });
+
+    it("should reject zero deposits and withdrawals", () => {
+      const { result: zeroDeposit } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(0)],
+        alice
+      );
+      expect(zeroDeposit).toBeErr(Cl.uint(206)); // ERR_MINIMUM_DEPOSIT_NOT_MET
+
+      // Make a deposit first for withdrawal test
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(5000000)],
+        alice
+      );
+
+      const { result: zeroWithdraw } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "withdraw",
+        [Cl.uint(1), Cl.uint(0)],
+        alice
+      );
+      expect(zeroWithdraw).toBeErr(Cl.uint(202)); // ERR_INVALID_AMOUNT
+    });
+  });
+
+  describe("Boundary Conditions & Large Amounts", () => {
+    it("should handle minimum deposits precisely", () => {
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Boundary Vault"),
+          Cl.uint(1),
+          Cl.uint(1000000), // 1 STX minimum
+        ],
+        deployer
+      );
+
+      // Exactly minimum should work
+      const { result: exactMin } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(1000000)],
+        alice
+      );
+      expect(exactMin).toBeOk(Cl.uint(1000000));
+
+      // Below minimum should fail
+      const { result: belowMin } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(999999)],
+        bob
+      );
+      expect(belowMin).toBeErr(Cl.uint(206)); // ERR_MINIMUM_DEPOSIT_NOT_MET
+    });
+
+    it("should handle very large amounts", () => {
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Large Amount Vault"),
+          Cl.uint(2),
+          Cl.uint(1000000),
+        ],
+        deployer
+      );
+
+      // 1 million STX deposit
+      const largeAmount = 1000000000000;
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(largeAmount)],
+        alice
+      );
+      expect(result).toBeOk(Cl.uint(largeAmount));
+    });
+  });
+
+  describe("Multi-Vault User Management", () => {
+    beforeEach(() => {
+      // Create 3 different vaults
+      for (let i = 1; i <= 3; i++) {
+        simnet.callPublicFn(
+          CONTRACT_NAME,
+          "create-vault",
+          [
+            Cl.stringAscii(`Multi Vault ${i}`),
+            Cl.uint(i),
+            Cl.uint(1000000),
+          ],
+          deployer
+        );
+      }
+    });
+
+    it("should track user participation across multiple vaults", () => {
+      // Alice deposits in vault 1 and 3
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(2000000)],
+        alice
+      );
+
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(3), Cl.uint(3000000)],
+        alice
+      );
+
+      // Check user's vault list
+      const { result } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-user-vaults",
+        [Cl.standardPrincipal(alice)],
+        alice
+      );
+      expect(result).toBeList([Cl.uint(1), Cl.uint(3)]);
+
+      // Verify individual vault values
+      const { result: vault1Value } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-user-vault-value",
+        [Cl.uint(1), Cl.standardPrincipal(alice)],
+        alice
+      );
+      expect(vault1Value).toBeUint(2000000);
+
+      const { result: vault3Value } = simnet.callReadOnlyFn(
+        CONTRACT_NAME,
+        "get-user-vault-value",
+        [Cl.uint(3), Cl.standardPrincipal(alice)],
+        alice
+      );
+      expect(vault3Value).toBeUint(3000000);
+    });
+  });
+
+  describe("Fee Calculation Edge Cases", () => {
+    beforeEach(() => {
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "create-vault",
+        [
+          Cl.stringAscii("Fee Test Vault"),
+          Cl.uint(2),
+          Cl.uint(1000000),
+        ],
+        deployer
+      );
+
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "deposit",
+        [Cl.uint(1), Cl.uint(10000000)], // 10 STX
+        alice
+      );
+    });
+
+    it("should handle maximum platform fee correctly", () => {
+      const maxFee = 1000; // 10%
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "set-platform-fee",
+        [Cl.uint(maxFee)],
+        deployer
+      );
+      expect(result).toBeOk(Cl.uint(maxFee));
+    });
+
+    it("should calculate fees correctly with different rates", () => {
+      // Set 2% fee
+      simnet.callPublicFn(
+        CONTRACT_NAME,
+        "set-platform-fee",
+        [Cl.uint(200)],
+        deployer
+      );
+
+      const withdrawShares = 5000000; // 5 STX
+      const expectedFee = Math.floor((withdrawShares * 200) / 10000); // 2%
+      const expectedWithdrawal = withdrawShares - expectedFee;
+
+      const { result } = simnet.callPublicFn(
+        CONTRACT_NAME,
+        "withdraw",
+        [Cl.uint(1), Cl.uint(withdrawShares)],
+        alice
+      );
+      expect(result).toBeOk(Cl.uint(expectedWithdrawal));
+    });
+  });
+});
 
